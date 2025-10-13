@@ -77,4 +77,4 @@ def _syn_imu(p, R, skip_ESKF=False):   # set skip_ESKF to False
 
 This may slightly improve performance (used in our previous work [PNP](https://xinyu-yi.github.io/PNP/)). Note that both versions have modeled the IMU raw signal noise and calibration error, and we recommend using the default setting for its fast speed and comparable effectiveness.
 
-*Note: The author has graduated and currently has limited time to format the codes in the repository. If you encounter any issues or have questions, feel free to open an issue. You may also contact me via the updated email address: yixy20@tsinghua.org.cn. (note that the university email provided in the paper is no longer active after graduation)*
+*Note: The author has graduated and currently has limited time to format the codes in the repository. If you encounter any issues or have questions, feel free to open an issue. You may also contact me via the updated email address: yixinyu1999@gmail.com (note that the university email provided in the paper is no longer active after graduation).*
