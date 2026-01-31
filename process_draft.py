@@ -1,5 +1,8 @@
+"""
+process_draft.py
+"""
+import csv
 import os
-import argparse
 import pickle
 import torch
 import glob
@@ -263,167 +266,298 @@ def process_amass():
     torch.save(data, 'data/dataset_work/AMASS/data.pt')
 
 
-def _read_movella_dot_csv(file_path):
-    arr = np.genfromtxt(file_path, delimiter=',', skip_header=1)
-    if arr.ndim == 1:
-        arr = arr[None, :]
-    if arr.shape[1] < 12:
-        raise ValueError(f'Unexpected CSV format: {file_path}')
-    arr = arr[:, :12]
-    arr = arr[~np.isnan(arr).any(axis=1)]
-    quat = arr[:, 2:6]  # wxyz
-    acc = arr[:, 6:9]   # m/s^2
-    gyr = arr[:, 9:12]  # deg/s
-    return quat, acc, gyr
+def process_movella(
+    input_dir=r"C:\Users\yuboh\GitHub\MovellaExporter\data\kickoff_sync",
+    out_path=r"data/dataset_work/Movella/data.pt",
+    seq_name="movella_kickoff",
+    tpose_range=(600, 700),
+    sensor_order=("leftarm", "rightarm", "leftleg", "rightleg", "head", "pelvis"),
+    gyro_unit="deg",   # "deg" or "rad"
+    acc_unit="m/s2",   # Movella DOT export is usually m/s^2
+):
+    """
+    Convert Movella DOT CSV exports to GlobalPose-style dataset dict.
+
+    Produces:
+      - RIS: [T, 6, 3, 3]  rotation matrices from IMU (sensor->inertial/world frame as exported)
+      - aS : [T, 6, 3]     accelerations (as exported; usually sensor frame)
+      - wS : [T, 6, 3]     angular vel (converted to rad/s)
+      - RSB: [6, 3, 3]     sensor-to-bone offset (estimated from T-pose window)
+      - RIM: [6, 3, 3]     inertial-to-model global alignment (identity for now)
+      - tran: [T, 3]       zeros (no translation from IMU-only)
+    """
 
 
-def _find_sensor_file(data_dir, prefix):
-    candidates = sorted([f for f in os.listdir(data_dir) if f.startswith(prefix) and f.endswith('.csv')])
-    if len(candidates) == 0:
-        raise FileNotFoundError(f'Cannot find CSV for prefix: {prefix}')
-    return os.path.join(data_dir, candidates[0])
+    def from_to_rotmat(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """
+        Return R such that R @ a ~= b. a,b are 3-vectors.
+        Stable for most cases; handles a ~ +/- b.
+        """
+        a = a / (a.norm() + 1e-8)
+        b = b / (b.norm() + 1e-8)
+
+        v = torch.cross(a, b, dim=0)
+        c = torch.clamp(torch.dot(a, b), -1.0, 1.0)
+        s = v.norm()
+
+        if s < 1e-8:
+            # parallel or anti-parallel
+            if c > 0:
+                return torch.eye(3)
+            # 180 deg: choose any axis orthogonal to a
+            axis = torch.tensor([1.0, 0.0, 0.0])
+            if torch.abs(a[0]) > 0.9:
+                axis = torch.tensor([0.0, 1.0, 0.0])
+            v = torch.cross(a, axis)
+            v = v / (v.norm() + 1e-8)
+            vx = art.math.hat(v.view(1, 3))[0]
+            return torch.eye(3) + 2.0 * (vx @ vx)
+
+        vx = art.math.hat(v.view(1, 3))[0]
+        R = torch.eye(3) + vx + (vx @ vx) * ((1.0 - c) / (s * s))
+        return R
 
 
-def _rotation_yaw(angle_rad: float) -> torch.Tensor:
-    c = torch.cos(torch.tensor(angle_rad))
-    s = torch.sin(torch.tensor(angle_rad))
-    return torch.tensor([[c, 0.0, s],
-                         [0.0, 1.0, 0.0],
-                         [-s, 0.0, c]])
+    print("======================== Processing Movella DOT Dataset ========================")
+    print("Input:", input_dir)
+    print("Output:", out_path)
 
+    # ------------- find files -------------
+    # Your filenames look like: head_D422CD0096A6_20260123_145514.csv
+    files = [f for f in os.listdir(input_dir) if f.lower().endswith(".csv")]
+    if len(files) == 0:
+        raise FileNotFoundError(f"No CSV files found in {input_dir}")
 
-def _sensor_flip_matrix(flip: str) -> torch.Tensor:
-    flip = (flip or "").lower()
-    sign_x = -1.0 if "x" in flip else 1.0
-    sign_y = -1.0 if "y" in flip else 1.0
-    sign_z = -1.0 if "z" in flip else 1.0
-    return torch.diag(torch.tensor([sign_x, sign_y, sign_z], dtype=torch.float32))
+    # map prefix -> filepath
+    # We'll match by prefix containing one of sensor_order keywords
+    prefix_to_file = {}
+    for f in files:
+        low = f.lower()
+        for key in sensor_order:
+            if low.startswith(key):
+                prefix_to_file[key] = os.path.join(input_dir, f)
+                break
 
+    missing = [k for k in sensor_order if k not in prefix_to_file]
+    if missing:
+        raise RuntimeError(f"Missing CSVs for sensors: {missing}\nFound: {list(prefix_to_file.keys())}")
 
-def process_kickoff_sync(data_dir='data/kickoff_sync',
-                          output_path='data/test_datasets/kickoff_sync.pt',
-                          tpose_start=600,
-                          tpose_end=700,
-                          sensor_flip='',
-                          global_yaw_deg=0.0):
-    print('======================== Processing kickoff_sync ========================')
-    sensor_order = ['leftarm2', 'rightarm2', 'leftleg2', 'rightleg2', 'head', 'pelvis2']
-    seq_name = os.path.basename(os.path.normpath(data_dir))
+    # ------------- read CSV helper -------------
+    def read_one_csv(csv_path: str):
+        """
+        Read Movella DOT exported CSV.
 
-    q_list, a_list, w_list = [], [], []
-    min_len = None
-    for prefix in sensor_order:
-        f = _find_sensor_file(data_dir, prefix)
-        quat, acc, gyr = _read_movella_dot_csv(f)
-        min_len = quat.shape[0] if min_len is None else min(min_len, quat.shape[0])
-        q_list.append(quat)
-        a_list.append(acc)
-        w_list.append(gyr)
+        Expected columns (case-insensitive):
+          PacketCounter, SampleTimeFine,
+          Quat_W, Quat_X, Quat_Y, Quat_Z,
+          Acc_X, Acc_Y, Acc_Z,
+          Gyr_X, Gyr_Y, Gyr_Z
+        """
+        pcs, qs, accs, gyrs = [], [], [], []
 
-    q_list = [q[:min_len] for q in q_list]
-    a_list = [a[:min_len] for a in a_list]
-    w_list = [w[:min_len] for w in w_list]
+        with open(csv_path, "r", newline="") as f:
+            reader = csv.DictReader(f, skipinitialspace=True)
+            # Normalize column names (strip + lower)
+            field_map = {(k or "").strip().lower(): k for k in (reader.fieldnames or [])}
 
-    quat = torch.from_numpy(np.stack(q_list, axis=1)).float()  # [T, 6, 4]
-    aS = torch.from_numpy(np.stack(a_list, axis=1)).float()    # [T, 6, 3]
-    wS = torch.from_numpy(np.stack(w_list, axis=1)).float()    # [T, 6, 3]
-    wS = wS * (np.pi / 180.0)
+            def get(row, name):
+                k = field_map.get(name.lower(), None)
+                if k is None:
+                    return None
+                v = row.get(k, "")
+                if v is None:
+                    return None
+                v = v.strip()
+                if v == "":
+                    return None
+                return v
 
-    RIS = art.math.quaternion_to_rotation_matrix(quat.view(-1, 4)).view(min_len, 6, 3, 3)
-    RIS = art.math.normalize_rotation_matrix(RIS.view(-1, 3, 3)).view(min_len, 6, 3, 3)
+            for row in reader:
+                # PacketCounter must exist and be numeric
+                pc_str = get(row, "PacketCounter")
+                qw_str = get(row, "Quat_W")
+                if pc_str is None or qw_str is None:
+                    continue  # skip blank/bad rows
 
-    C_S = _sensor_flip_matrix(sensor_flip)
-    if not torch.allclose(C_S, torch.eye(3)):
-        RIS = RIS.matmul(C_S)
+                try:
+                    pc = int(float(pc_str))
+                    qw = float(get(row, "Quat_W"))
+                    qx = float(get(row, "Quat_X"))
+                    qy = float(get(row, "Quat_Y"))
+                    qz = float(get(row, "Quat_Z"))
+
+                    ax = float(get(row, "Acc_X"))
+                    ay = float(get(row, "Acc_Y"))
+                    az = float(get(row, "Acc_Z"))
+
+                    gx = float(get(row, "Gyr_X"))
+                    gy = float(get(row, "Gyr_Y"))
+                    gz = float(get(row, "Gyr_Z"))
+                except (TypeError, ValueError):
+                    continue  # skip any partially-written row
+
+                pcs.append(pc)
+                qs.append([qw, qx, qy, qz])
+                accs.append([ax, ay, az])
+                gyrs.append([gx, gy, gz])
+
+        if len(pcs) == 0:
+            raise RuntimeError(
+                f"No valid rows parsed from: {csv_path}\n"
+                f"Check header names and whether the file is empty."
+            )
+
+        pc = np.asarray(pcs, dtype=np.int64)
+        q = np.asarray(qs, dtype=np.float32)  # (T,4)
+        acc = np.asarray(accs, dtype=np.float32)  # (T,3)
+        gyr = np.asarray(gyrs, dtype=np.float32)  # (T,3)
+        return pc, q, acc, gyr
+
+    # ------------- load all sensors -------------
+    pcs, qs, accs, gyrs = [], [], [], []
+    for key in sensor_order:
+        pc, q, acc, gyr = read_one_csv(prefix_to_file[key])
+        pcs.append(pc); qs.append(q); accs.append(acc); gyrs.append(gyr)
+
+    # ------------- align length by min frames (safety) -------------
+    T = min([q.shape[0] for q in qs])
+    qs   = [q[:T] for q in qs]
+    accs = [a[:T] for a in accs]
+    gyrs = [w[:T] for w in gyrs]
+    print(f"Loaded {len(sensor_order)} sensors, aligned length T={T}")
+
+    # ------------- stack tensors: [T,6,*] -------------
+    q = torch.from_numpy(np.stack(qs, axis=1)).float()        # [T,6,4] wxyz
+    a = torch.from_numpy(np.stack(accs, axis=1)).float()      # [T,6,3]
+    w = torch.from_numpy(np.stack(gyrs, axis=1)).float()      # [T,6,3]
+
+    # convert gyro to rad/s if needed
+    if gyro_unit.lower() == "deg":
+        w = w * (torch.pi / 180.0)
+
+    # ------------- RIS (rotation matrices) -------------
+    RIS = art.math.quaternion_to_rotation_matrix(q.view(-1, 4)).view(T, 6, 3, 3)
+    RIS = art.math.normalize_rotation_matrix(RIS.view(-1, 3, 3)).view(T, 6, 3, 3)
+
+    # ---- sensor-frame convention fix (Movella sensor axes -> expected sensor axes) ----
+    # If RIS maps sensor->inertial, then applying a constant sensor-axis change C_S means:
+    #   RIS' = RIS @ C_S
+    # and vectors expressed in sensor coords must also change:
+    #   v' = C_S^T @ v   (for a, w)
+    C_S = torch.eye(3, device=RIS.device, dtype=RIS.dtype)
+
+    # Example candidates (only one at a time):
+    # C_S = torch.diag(torch.tensor([1.0, -1.0, -1.0], device=RIS.device, dtype=RIS.dtype))   # 180° about X
+    # C_S = torch.diag(torch.tensor([-1.0, 1.0, -1.0], device=RIS.device, dtype=RIS.dtype))   # 180° about Y
+    # C_S = torch.diag(torch.tensor([-1.0, -1.0, 1.0], device=RIS.device, dtype=RIS.dtype))   # 180° about Z
+
+    if not torch.allclose(C_S, torch.eye(3, device=RIS.device, dtype=RIS.dtype)):
+        RIS = RIS.matmul(C_S)  # [T,6,3,3]
+
+        # Rotate IMU vectors into the same "new sensor frame"
         Ct = C_S.t()
-        aS = Ct.view(1, 1, 3, 3).matmul(aS.unsqueeze(-1)).squeeze(-1)
-        wS = Ct.view(1, 1, 3, 3).matmul(wS.unsqueeze(-1)).squeeze(-1)
+        a = Ct.view(1, 1, 3, 3).matmul(a.unsqueeze(-1)).squeeze(-1)  # [T,6,3]
+        w = Ct.view(1, 1, 3, 3).matmul(w.unsqueeze(-1)).squeeze(-1)  # [T,6,3]
 
-    tpose_start = max(0, min(tpose_start, min_len - 1))
-    tpose_end = max(tpose_start, min(tpose_end, min_len - 1))
-    # Movella DOT: ENU world frame -> SMPL (X right, Y up, Z forward) swap Y/Z.
-    R_enu_to_smpl = torch.tensor([[1.0, 0.0, 0.0],
-                                  [0.0, 0.0, 1.0],
-                                  [0.0, 1.0, 0.0]])
-    RIM = R_enu_to_smpl.unsqueeze(0).repeat(6, 1, 1)
+    # ------------- T-pose calibration for RSB -------------
+    s0, s1 = tpose_range
+    s0 = max(0, min(T - 1, s0))
+    s1 = max(s0 + 1, min(T, s1))
+    print(f"Using T-pose frames [{s0} .. {s1-1}] for RSB")
 
-    if global_yaw_deg != 0.0:
-        R_yaw = _rotation_yaw(global_yaw_deg * np.pi / 180.0)
-        RIM = RIM.matmul(R_yaw.t())
-    RIM = art.math.normalize_rotation_matrix(RIM.view(-1, 3, 3)).view(6, 3, 3)
+    # ---- estimate rest specific-force direction in Movella inertial frame ----
+    aI_tpose = RIS[s0:s1].matmul(a[s0:s1].unsqueeze(-1)).squeeze(-1)  # [K,6,3]
+    print("mean aI_tpose:", aI_tpose.mean(dim=(0, 1)))
 
-    # calibrate RSB so that RMB matches SMPL zero-pose global rotations
+    fI_est = aI_tpose.mean(dim=(0, 1))  # specific force at rest (points "up")
+
+    # ---- align Movella inertial to model frame using rest specific force ----
+    f_rest_model = torch.tensor([0.0, +9.8, 0.0])  # equals -g_world_model
+    R_I_to_M = from_to_rotmat(fI_est, f_rest_model)
+    RIM = R_I_to_M.t().repeat(6, 1, 1)
+
+    # ------------- T-pose calibration for RSB (use SMPL zero-pose target, not identity) -------------
+
+    # 1) Get SMPL zero-pose global rotations as target RMB for the 6 joints
     model = art.ParametricModel("models/SMPL_male.pkl")
-    R_local0 = torch.eye(3).view(1, 1, 3, 3).repeat(1, 24, 1, 1)
-    R_global0 = model.forward_kinematics_R(R_local0)[0]
-    joint_idx = torch.tensor([18, 19, 4, 5, 15, 0], dtype=torch.long)
-    RMB_target = R_global0[joint_idx]
 
-    A = RIM.transpose(1, 2).unsqueeze(0).matmul(RIS[tpose_start:tpose_end + 1])
+    R_local0 = torch.eye(3).view(1, 1, 3, 3).repeat(1, 24, 1, 1)  # [1,24,3,3] all identity local rotations
+    R_global0 = model.forward_kinematics_R(R_local0)[0]  # [24,3,3] global rotations in SMPL zero pose
+
+    # IMPORTANT: joint indices must match your sensor placement
+    # This is the same mapping used in TotalCapture debug: [L_LowArm, R_LowArm, L_LowLeg, R_LowLeg, Head, Pelvis]
+    # If your sensors are on upper-arm / thigh (not forearm / shank), you MUST change these indices.
+    joint_idx = torch.tensor([18, 19, 4, 5, 15, 0], dtype=torch.long)
+    RMB_target = R_global0[joint_idx]  # [6,3,3]
+
+    # 2) Estimate RSB so that: (RIM^T * RIS) * RSB ~= RMB_target during T-pose
     RSB = torch.zeros(6, 3, 3)
+
+    A = RIM.transpose(1, 2).unsqueeze(0).matmul(RIS[s0:s1])  # [K,6,3,3]  A = RIM^T * RIS
+
     for j in range(6):
+        # RSB_j ≈ mean_k ( A_kj^T * RMB_target_j )
         RSB_j = A[:, j].transpose(1, 2).matmul(RMB_target[j].view(1, 3, 3)).mean(dim=0)
         RSB[j] = art.math.normalize_rotation_matrix(RSB_j.view(1, 3, 3))[0]
-    RSB = art.math.normalize_rotation_matrix(RSB.view(-1, 3, 3)).view(6, 3, 3)
 
-    mS = torch.zeros_like(aS)
-    tran = torch.zeros(min_len, 3)
+    RMB_tpose_est = RIM.transpose(1, 2).matmul(RIS[s0:s1]).matmul(RSB)  # [K,6,3,3]
 
+    K = RMB_tpose_est.shape[0]
+    RMB_target_K = RMB_target.unsqueeze(0).expand(K, -1, -1, -1)  # [K,6,3,3]
+
+    err = art.math.radian_to_degree(
+        art.math.angle_between(
+            RMB_tpose_est.reshape(-1, 3, 3),
+            RMB_target_K.reshape(-1, 3, 3),
+        )
+    ).mean()
+
+    print("T-pose RMB error (deg):", float(err))
+
+
+    # translation is unknown from IMU-only; keep zero
+    tran = torch.zeros(T, 3)
+
+    # ------------- build dataset dict -------------
     data = {
-        'name': [seq_name],
-        'RIM': [RIM],
-        'RSB': [RSB],
-        'RIS': [RIS],
-        'aS': [aS],
-        'wS': [wS],
-        'mS': [mS],
-        'tran': [tran],
+        "name": [seq_name],
+        "RIM":  [RIM],
+        "RSB":  [RSB],
+        "RIS":  [RIS],
+        "aS":   [a],
+        "wS":   [w],
+        "mS":   [torch.zeros_like(a)],  # Movella export you showed doesn't include mag; keep zeros
+        "tran": [tran],
     }
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    torch.save(data, output_path)
-    print('Saved to', output_path)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    torch.save(data, out_path)
+    print("Saved:", out_path)
+    print("Keys:", list(data.keys()))
+    print("Shapes:",
+          "RIS", tuple(RIS.shape),
+          "aS", tuple(a.shape),
+          "wS", tuple(w.shape),
+          "RIM", tuple(RIM.shape),
+          "RSB", tuple(RSB.shape),
+          "tran", tuple(tran.shape))
+
+    # -------- sanity checks for test.py convention --------
+    g = torch.tensor([0.0, -9.8, 0.0])
+    aM = RIM.transpose(1, 2).matmul(RIS).matmul(a.unsqueeze(-1)).squeeze(-1) + g
+    print("aM[s0:s1]: ", aM[s0:s1].mean(dim=(0, 1)))  # should be close to [0,0,0]
+    RMB = RIM.transpose(1, 2).matmul(RIS).matmul(RSB)
+
+    for j, name in enumerate(["LArm", "RArm", "LLeg", "RLeg", "Head", "Pelvis"]):
+        print(name)
+        print("x:", RMB[s0, j, :, 0])
+        print("y:", RMB[s0, j, :, 1])
+        print("z:", RMB[s0, j, :, 2])
 
 
 if __name__ == '__main__':
     # import sys; sys.stdout = open('data/dataset_work/log.txt', 'a')
-    parser = argparse.ArgumentParser(description='Dataset preprocessing utilities.')
-    parser.add_argument(
-        '--dataset',
-        choices=['kickoff_sync', 'dipimu', 'totalcapture', 'amass', 'all'],
-        default='kickoff_sync',
-        help='Which dataset to process.'
-    )
-    parser.add_argument('--kickoff-dir', type=str, default='data/kickoff_sync', help='Kickoff CSV folder.')
-    parser.add_argument('--kickoff-out', type=str, default='data/test_datasets/kickoff_sync.pt', help='Output .pt path.')
-    parser.add_argument('--tpose-start', type=int, default=600, help='T-pose start frame (inclusive).')
-    parser.add_argument('--tpose-end', type=int, default=700, help='T-pose end frame (inclusive).')
-    parser.add_argument(
-        '--sensor-flip',
-        type=str,
-        default='',
-        help='Flip sensor axes (any combo of x,y,z), e.g. "x", "yz", "xyz".',
-    )
-    parser.add_argument(
-        '--global-yaw',
-        type=float,
-        default=0.0,
-        help='Extra yaw correction in degrees (model up axis).',
-    )
-    args = parser.parse_args()
-
-    if args.dataset in ('kickoff_sync', 'all'):
-        process_kickoff_sync(
-            data_dir=args.kickoff_dir,
-            output_path=args.kickoff_out,
-            tpose_start=args.tpose_start,
-            tpose_end=args.tpose_end,
-            sensor_flip=args.sensor_flip,
-            global_yaw_deg=args.global_yaw,
-        )
-    if args.dataset in ('dipimu', 'all'):
-        process_dipimu()
-    if args.dataset in ('totalcapture', 'all'):
-        process_totalcapture()
-    if args.dataset in ('amass', 'all'):
-        process_amass()
+    # process_amass()
+    # process_totalcapture()
+    # process_dipimu()
+    process_movella()

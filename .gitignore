@@ -1,6 +1,7 @@
 models
 data/temp
 data/test_datasets
+daata/kickoff_sync
 data/weights.pt
 .idea
 __pycache__/

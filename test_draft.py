@@ -1,5 +1,8 @@
+"""
+test_draft.py
+"""
+
 import os
-import argparse
 import torch
 import tqdm
 import numpy as np
@@ -203,64 +206,79 @@ def compare_realimu(data, dataset_name='', save_results_dir='data/temp/results',
         print('\n'.join([k + '  %.2f%%' % (torch.stack([_.mean() for _ in v[7]]).mean().item() / 7 * 100) for k, v in tran_errors.items()]))
 
 
-def infer_dataset(data, dataset_name='', save_results_dir='data/temp/results'):
-    print('======================= Inference on %s =======================' % dataset_name)
+def run_realimu_inference_only(data, dataset_name='Movella', save_results_dir='data/temp/results'):
+    print('======================= Inference on %s Real Dataset =======================' % dataset_name)
     g = torch.tensor([0, -9.8, 0])
-    nets = {'GlobalPose': GPNet().eval().to(device)}
+
+    nets = {
+        'GlobalPose': GPNet().eval().to(device),
+    }
+
     pose_results = {k: [] for k in nets.keys()}
     tran_results = {k: [] for k in nets.keys()}
 
-    for seq_idx in range(len(data['RIS'])):
-        aS = data['aS'][seq_idx]
-        wS = data['wS'][seq_idx]
-        RIS = data['RIS'][seq_idx]
-        RIM = data['RIM'][seq_idx]
-        RSB = data['RSB'][seq_idx]
+    # Your Movella data.pt is a "single-seq dict" (not list-of-seq).
+    # test.py expects list-of-seq, so wrap if needed.
+    def ensure_list(x):
+        return x if isinstance(x, (list, tuple)) else [x]
 
+    data_seq = {
+        'aS': ensure_list(data['aS']),
+        'wS': ensure_list(data['wS']),
+        'mS': ensure_list(data['mS']),
+        'RIS': ensure_list(data['RIS']),
+        'RIM': ensure_list(data['RIM']),
+        'RSB': ensure_list(data['RSB']),
+        'tran': ensure_list(data['tran']),
+    }
+
+    for seq_idx in range(len(data_seq['RIS'])):
+        aS = data_seq['aS'][seq_idx].float()
+        wS = data_seq['wS'][seq_idx].float()
+        RIS = data_seq['RIS'][seq_idx].float()
+        RIM = data_seq['RIM'][seq_idx].float()
+        RSB = data_seq['RSB'][seq_idx].float()
+
+        T = RIS.shape[0]
+        tran_pred_placeholder = torch.zeros(T, 3)  # no GT, just shape placeholder
+
+        # RMB / aM / wM (same math as compare_realimu)
+        # Correct batch math (T,6,3,3):
         RMB = RIM.transpose(1, 2).matmul(RIS).matmul(RSB).to(device)
         aM = (RIM.transpose(1, 2).matmul(RIS).matmul(aS.unsqueeze(-1)).squeeze(-1) + g).to(device)
         wM = RIM.transpose(1, 2).matmul(RIS).matmul(wS.unsqueeze(-1)).squeeze(-1).to(device)
 
-        init_pose = torch.eye(3).repeat(24, 1, 1)
         for net in nets.values():
-            net.rnn_initialize(init_pose)
-            net.pose_prediction = torch.zeros(RIS.shape[0], 24, 3, 3)
-            net.tran_prediction = torch.zeros(RIS.shape[0], 3)
+            net.rnn_initialize(torch.eye(3, device=device).repeat(24, 1, 1))  # dummy init pose
+            net.pose_prediction = torch.zeros(T, 24, 3, 3, device=device)
+            net.tran_prediction = torch.zeros(T, 3, device=device)
 
-        for i in tqdm.trange(RIS.shape[0]):
+        for i in tqdm.trange(T):
             for net in nets.values():
                 net.pose_prediction[i], net.tran_prediction[i] = net.forward_frame(aM[i], wM[i], RMB[i])
 
         for k in nets.keys():
-            pose_results[k].append(nets[k].pose_prediction.cpu())
-            tran_results[k].append(nets[k].tran_prediction.cpu())
+            pose_results[k].append(nets[k].pose_prediction.detach().cpu())
+            tran_results[k].append(nets[k].tran_prediction.detach().cpu())
 
     os.makedirs(save_results_dir, exist_ok=True)
     for k in nets.keys():
-        torch.save({'pose': pose_results[k], 'tran': tran_results[k]}, os.path.join(save_results_dir, dataset_name + '_' + k.strip() + '.pt'))
-    print('Saved results to', save_results_dir)
+        out_path = os.path.join(save_results_dir, f'{dataset_name}_{k.strip()}.pt')
+        torch.save({'pose': pose_results[k], 'tran': tran_results[k]}, out_path)
+        print('Saved:', out_path)
 
 
 if __name__ == '__main__':
     torch.set_printoptions(sci_mode=False)
-    parser = argparse.ArgumentParser(description='Run evaluation or inference.')
-    parser.add_argument('--dataset', type=str, default='', help='Path to a preprocessed dataset .pt file.')
-    parser.add_argument('--name', type=str, default='Custom', help='Dataset name for output file.')
-    args = parser.parse_args()
 
-    if args.dataset:
-        try:
-            data = torch.load(args.dataset, weights_only=True)
-        except TypeError:
-            data = torch.load(args.dataset)
-        infer_dataset(data, dataset_name=args.name)
-    else:
-        data = torch.load('data/test_datasets/totalcapture_officalib.pt')
-        compare_realimu(data, dataset_name='TotalCapture (Official Calibration)')
+    # data = torch.load('data/test_datasets/totalcapture_officalib.pt')
+    # compare_realimu(data, dataset_name='TotalCapture (Official Calibration)')
+    #
+    # data = torch.load('data/test_datasets/totalcapture_dipcalib.pt')
+    # compare_realimu(data, dataset_name='TotalCapture (DIP Calibration)')
+    #
+    # data = torch.load('data/test_datasets/dipimu.pt')
+    # compare_realimu(data, dataset_name='DIP-IMU', evaluate_tran=False)
 
-        data = torch.load('data/test_datasets/totalcapture_dipcalib.pt')
-        compare_realimu(data, dataset_name='TotalCapture (DIP Calibration)')
-
-        data = torch.load('data/test_datasets/dipimu.pt')
-        compare_realimu(data, dataset_name='DIP-IMU', evaluate_tran=False)
-
+    data = torch.load('data/dataset_work/Movella/data.pt')
+    run_realimu_inference_only(data, dataset_name='Movella')
