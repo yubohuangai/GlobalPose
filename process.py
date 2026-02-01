@@ -292,6 +292,26 @@ def _rotation_yaw(angle_rad: float) -> torch.Tensor:
                          [-s, 0.0, c]])
 
 
+def _from_to_rotmat(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    a = a / (a.norm() + 1e-8)
+    b = b / (b.norm() + 1e-8)
+    v = torch.cross(a, b, dim=0)
+    c = torch.clamp(torch.dot(a, b), -1.0, 1.0)
+    s = v.norm()
+    if s < 1e-8:
+        if c > 0:
+            return torch.eye(3)
+        axis = torch.tensor([1.0, 0.0, 0.0])
+        if torch.abs(a[0]) > 0.9:
+            axis = torch.tensor([0.0, 1.0, 0.0])
+        v = torch.cross(a, axis)
+        v = v / (v.norm() + 1e-8)
+        vx = art.math.hat(v.view(1, 3))[0]
+        return torch.eye(3) + 2.0 * (vx @ vx)
+    vx = art.math.hat(v.view(1, 3))[0]
+    return torch.eye(3) + vx + (vx @ vx) * ((1.0 - c) / (s * s))
+
+
 def _sensor_flip_matrix(flip: str) -> torch.Tensor:
     flip = (flip or "").lower()
     sign_x = -1.0 if "x" in flip else 1.0
@@ -304,8 +324,9 @@ def process_kickoff_sync(data_dir='data/kickoff_sync',
                           output_path='data/test_datasets/kickoff_sync.pt',
                           tpose_start=600,
                           tpose_end=700,
+                          rim_method='enu',
                           sensor_flip='',
-                          global_yaw_deg=0.0):
+                          global_yaw_deg=180):
     print('======================== Processing kickoff_sync ========================')
     sensor_order = ['leftarm2', 'rightarm2', 'leftleg2', 'rightleg2', 'head', 'pelvis2']
     seq_name = os.path.basename(os.path.normpath(data_dir))
@@ -341,15 +362,27 @@ def process_kickoff_sync(data_dir='data/kickoff_sync',
 
     tpose_start = max(0, min(tpose_start, min_len - 1))
     tpose_end = max(tpose_start, min(tpose_end, min_len - 1))
-    # Movella DOT: ENU world frame -> SMPL (X right, Y up, Z forward) swap Y/Z.
+
     R_enu_to_smpl = torch.tensor([[1.0, 0.0, 0.0],
                                   [0.0, 0.0, 1.0],
                                   [0.0, 1.0, 0.0]])
     RIM = R_enu_to_smpl.unsqueeze(0).repeat(6, 1, 1)
 
+    if rim_method == 'gravity':
+        # Gravity alignment: estimate inertial -> model using T-pose specific force.
+        aI_tpose = RIS[tpose_start:tpose_end + 1].matmul(aS[tpose_start:tpose_end + 1].unsqueeze(-1)).squeeze(-1)
+        fI_est = aI_tpose.mean(dim=(0, 1))
+        f_rest_model = torch.tensor([0.0, 9.8, 0.0])
+        R_I_to_M = _from_to_rotmat(fI_est, f_rest_model)
+        RIM = R_I_to_M.t().repeat(6, 1, 1)
+
     if global_yaw_deg != 0.0:
+        print("RIM before yaw:")
+        print(RIM[0].numpy())
         R_yaw = _rotation_yaw(global_yaw_deg * np.pi / 180.0)
         RIM = RIM.matmul(R_yaw.t())
+        print("RIM after yaw:")
+        print(RIM[0].numpy())
     RIM = art.math.normalize_rotation_matrix(RIM.view(-1, 3, 3)).view(6, 3, 3)
 
     # calibrate RSB so that RMB matches SMPL zero-pose global rotations
@@ -399,6 +432,12 @@ if __name__ == '__main__':
     parser.add_argument('--tpose-start', type=int, default=600, help='T-pose start frame (inclusive).')
     parser.add_argument('--tpose-end', type=int, default=700, help='T-pose end frame (inclusive).')
     parser.add_argument(
+        '--rim-method',
+        choices=['enu', 'gravity'],
+        default='enu',
+        help='Global frame alignment method for Movella DOT.',
+    )
+    parser.add_argument(
         '--sensor-flip',
         type=str,
         default='',
@@ -418,6 +457,7 @@ if __name__ == '__main__':
             output_path=args.kickoff_out,
             tpose_start=args.tpose_start,
             tpose_end=args.tpose_end,
+            rim_method=args.rim_method,
             sensor_flip=args.sensor_flip,
             global_yaw_deg=args.global_yaw,
         )
